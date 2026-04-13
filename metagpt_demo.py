@@ -21,18 +21,35 @@ Setup:
   python metagpt_demo.py
 """
 
-import asyncio, os, sys, functools
+import asyncio, os, sys, functools, time
 import sentinel
 from sentinel import ContractViolationError
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
 SENTINEL_API_KEY = os.environ.get("SENTINEL_API_KEY") or (sys.argv[1] if len(sys.argv) > 1 else None)
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY")
+
 if not SENTINEL_API_KEY:
     print("Set SENTINEL_API_KEY env var or pass as first argument.")
     sys.exit(1)
+if not OPENAI_API_KEY:
+    print("Set OPENAI_API_KEY env var.")
+    sys.exit(1)
 
 sentinel.init(api_key=SENTINEL_API_KEY)
+
+# ── MetaGPT config — set API key programmatically ─────────────────────────────
+# Must happen before any metagpt imports that touch Config
+
+os.makedirs(os.path.expanduser("~/.metagpt"), exist_ok=True)
+with open(os.path.expanduser("~/.metagpt/config2.yaml"), "w") as f:
+    f.write(f"""llm:
+  api_type: "openai"
+  model: "gpt-4o-mini"
+  api_key: "{OPENAI_API_KEY}"
+  max_token: 4096
+""")
 
 # ── Contracts ─────────────────────────────────────────────────────────────────
 
@@ -52,15 +69,15 @@ sentinel.register_contract(
     },
 )
 
-# ── Patch Role.run — each full role execution = one Sentinel step ──────────────
-# Patching run() rather than _act() because _act() is called multiple times
-# per role (once per action). run() wraps the complete role turn.
+# ── Patch ActionNode._aask_v1 — the real LLM gateway in MetaGPT ───────────────
+# Role._act() calls Action.run() → ActionNode._aask_v1() → BaseLLM.aask()
+# Patching here gives us one trace per actual LLM call.
 
-from metagpt.roles.role import Role
+from metagpt.actions.action_node import ActionNode
 
-_original_run = Role.run
-_active_run_ref = [None]
-_role_outputs   = {}
+_original_aask_v1 = ActionNode._aask_v1
+_active_run_ref   = [None]
+_role_outputs     = {}
 
 HANDOFF_CONTRACTS = {
     "ProductManager": ("ProductManager", "Architect",
@@ -75,42 +92,78 @@ HANDOFF_CONTRACTS = {
                   }),
 }
 
-@functools.wraps(_original_run)
-async def _traced_run(self, with_message=None):
-    role_name = self.__class__.__name__
+@functools.wraps(_original_aask_v1)
+async def _traced_aask_v1(self, prompt, schema, mode, images=None):
     run = _active_run_ref[0]
     if run is None:
-        return await _original_run(self, with_message)
+        return await _original_aask_v1(self, prompt, schema, mode, images)
 
-    with run.step(role_name, step_type="llm_call") as step:
+    # Derive a readable step name from the action class
+    action_name = type(self).__name__ if hasattr(self, "__class__") else "llm_call"
+    # Walk up: ActionNode lives inside an Action, which has a role
+    role_name = "unknown"
+    if hasattr(self, "llm") and hasattr(self.llm, "_role_name"):
+        role_name = self.llm._role_name
+
+    step_name = action_name
+    t0 = time.time()
+
+    with run.step(step_name, step_type="llm_call") as step:
         step.set_input({
-            "role":    role_name,
-            "profile": getattr(self, "profile", role_name),
+            "action": action_name,
+            "prompt_chars": len(str(prompt)) if prompt else 0,
         })
-        result = await _original_run(self, with_message)
-
-        # Collect the role's full output from its memory
-        content = ""
-        if hasattr(self, "rc") and hasattr(self.rc, "memory"):
-            msgs = self.rc.memory.storage
-            # Find the last message this role authored
-            for msg in reversed(msgs):
-                sent_by = getattr(msg, "sent_from", None) or getattr(msg, "role", None)
-                if sent_by == role_name or sent_by is None:
-                    content = str(getattr(msg, "content", ""))
-                    break
-
-        if not content and result is not None:
-            content = str(getattr(result, "content", result))
-
+        result = await _original_aask_v1(self, prompt, schema, mode, images)
+        duration_ms = int((time.time() - t0) * 1000)
+        content = str(result) if result else ""
         step.set_output({
             "output_chars": len(content),
-            "preview":      content[:300] if content else "",
+            "preview":      content[:200],
+            "duration_ms":  duration_ms,
         })
-        _role_outputs[role_name] = content
 
-    # Validate handoff contract after the role fully completes
-    if role_name in HANDOFF_CONTRACTS and content:
+    return result
+
+ActionNode._aask_v1 = _traced_aask_v1
+
+# ── Also patch Role._act to track which role is running + fire contracts ───────
+
+from metagpt.roles.role import Role
+
+_original_act = Role._act
+
+@functools.wraps(_original_act)
+async def _traced_act(self):
+    role_name = self.__class__.__name__
+    result = await _original_act(self)
+
+    content = ""
+    if result is not None:
+        content = str(getattr(result, "content", result))
+
+    if content:
+        _role_outputs[role_name] = _role_outputs.get(role_name, "") + content
+
+    return result
+
+Role._act = _traced_act
+
+# ── Wrap the full role run to fire handoff contracts once per role ─────────────
+
+from metagpt.roles.role import Role as _Role
+
+_original_run = _Role.run
+
+@functools.wraps(_original_run)
+async def _traced_role_run(self, with_message=None):
+    role_name = self.__class__.__name__
+    result = await _original_run(self, with_message)
+
+    # Only fire handoff if the role produced output this turn
+    content = _role_outputs.pop(role_name, "")
+    run = _active_run_ref[0]
+
+    if content and run and role_name in HANDOFF_CONTRACTS:
         from_agent, to_agent, make_payload = HANDOFF_CONTRACTS[role_name]
         payload = make_payload(content)
         sentinel.handoff(
@@ -122,15 +175,13 @@ async def _traced_run(self, with_message=None):
 
     return result
 
-Role.run = _traced_run
+_Role.run = _traced_role_run
 
 # ── Pipeline runner ───────────────────────────────────────────────────────────
 
 async def run_software_team(idea: str):
     from metagpt.team import Team
     from metagpt.roles import ProductManager, Architect, Engineer, ProjectManager
-
-    _role_outputs.clear()
 
     team = Team()
     team.hire([
@@ -148,6 +199,7 @@ async def run_software_team(idea: str):
             await team.run(idea=idea, n_round=5)
         finally:
             _active_run_ref[0] = None
+            _role_outputs.clear()
 
 # ── Ideas ─────────────────────────────────────────────────────────────────────
 
@@ -166,8 +218,7 @@ async def main():
         print(f"[{i}/{len(IDEAS)}] {idea[:58]}")
         try:
             await run_software_team(idea)
-            roles = list(_role_outputs.keys())
-            print(f"         ✓ roles: {', '.join(roles)}\n")
+            print(f"         ✓ done\n")
         except ContractViolationError as e:
             print(f"         ✗ BLOCKED — {e}\n")
         except Exception as e:
