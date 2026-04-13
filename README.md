@@ -174,3 +174,8 @@ When a contract fails, Sentinel:
 - [sentinelai-sdk on PyPI](https://pypi.org/project/sentinelai-sdk/)
 - [Dashboard](https://www.agentsentinelai.com/dashboard)
 - [gpt-researcher](https://github.com/assafelovic/gpt-researcher)
+
+
+
+<img width="1511" height="855" alt="Screenshot 2026-04-12 at 5 06 07 PM" src="https://github.com/user-attachments/assets/7bab5e87-3d38-4d06-ba30-4c03e2bb0b10" />
+
