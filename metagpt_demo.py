@@ -93,29 +93,23 @@ HANDOFF_CONTRACTS = {
 }
 
 @functools.wraps(_original_aask_v1)
-async def _traced_aask_v1(self, prompt, schema, mode, images=None):
+async def _traced_aask_v1(self, *args, **kwargs):
     run = _active_run_ref[0]
     if run is None:
-        return await _original_aask_v1(self, prompt, schema, mode, images)
+        return await _original_aask_v1(self, *args, **kwargs)
 
-    # Derive a readable step name from the action class
-    action_name = type(self).__name__ if hasattr(self, "__class__") else "llm_call"
-    # Walk up: ActionNode lives inside an Action, which has a role
-    role_name = "unknown"
-    if hasattr(self, "llm") and hasattr(self.llm, "_role_name"):
-        role_name = self.llm._role_name
+    # args: (prompt, output_class_name, output_data_mapping, ...)
+    prompt           = args[0] if len(args) > 0 else kwargs.get("prompt", "")
+    output_class_name = args[1] if len(args) > 1 else kwargs.get("output_class_name", "llm_call")
+    step_name = str(output_class_name) if output_class_name else "llm_call"
 
-    step_name = action_name
     t0 = time.time()
-
     with run.step(step_name, step_type="llm_call") as step:
-        step.set_input({
-            "action": action_name,
-            "prompt_chars": len(str(prompt)) if prompt else 0,
-        })
-        result = await _original_aask_v1(self, prompt, schema, mode, images)
+        step.set_input({"prompt_chars": len(str(prompt)) if prompt else 0})
+        result = await _original_aask_v1(self, *args, **kwargs)
         duration_ms = int((time.time() - t0) * 1000)
-        content = str(result) if result else ""
+        # _aask_v1 returns (content_str, parsed_model) tuple
+        content = str(result[0]) if isinstance(result, tuple) else str(result or "")
         step.set_output({
             "output_chars": len(content),
             "preview":      content[:200],
